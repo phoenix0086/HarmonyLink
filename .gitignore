@@ -6,9 +6,15 @@
 !/build.sh
 !/Sources/
 !/Resources/
+!/docs/
 
 /Sources/*
 !/Sources/*.swift
 /Resources/*
 !/Resources/AppIcon.png
 !/Resources/AppIcon.icns
+
+/docs/*
+!/docs/mirror-usb.jpg
+!/docs/connection-details.jpg
+!/docs/wechat-qr.png

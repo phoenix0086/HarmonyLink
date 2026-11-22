@@ -1,6 +1,12 @@
 # HarmonyLink · 鸿蒙投屏
 
-一个 Apple 芯片 Mac 上的原生应用。通过 USB 或同一局域网的 Wi‑Fi 显示鸿蒙手机画面，并从 Mac 操作手机。
+HarmonyLink 是一款面向 Apple 芯片 Mac 的鸿蒙投屏应用。用 USB 或同一局域网的 Wi‑Fi 连上手机，就能在 Mac 上看手机画面、用鼠标操作和键盘打字。你也可以把文件拖进手机，或者把图库里的原图拖到 Finder。已在原生鸿蒙 7.0 手机上实测。
+
+## 实机截图
+
+| USB 投屏与鼠标操作 | 连接详情与文件发送 |
+| :---: | :---: |
+| <img src="docs/mirror-usb.jpg" width="260" alt="HarmonyLink 通过 USB 投屏并操作手机计算器"> | <img src="docs/connection-details.jpg" width="260" alt="HarmonyLink 的 USB 连接详情和文件发送入口"> |
 
 ## 功能
 
@@ -26,6 +32,10 @@ open dist/HarmonyLink.app
 ```
 
 USB 模式下，在手机上解锁并授权 USB 调试。Wi‑Fi 模式下，在手机的开发者选项里查看无线调试地址，然后在应用中填入 `IP:端口`。
+
+## 反馈与联系
+
+遇到连接、操作或文件传输问题，欢迎通过 [GitHub Issues](https://github.com/phoenix0086/HarmonyLink/issues) 联系作者。反馈时请附上手机型号、鸿蒙版本、macOS 版本、连接方式以及能复现问题的操作步骤。
 
 ## 许可
 
