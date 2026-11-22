@@ -35,7 +35,7 @@ USB 模式下，在手机上解锁并授权 USB 调试。Wi‑Fi 模式下，在
 
 ## 反馈与联系
 
-遇到连接、操作或文件传输问题，欢迎通过 [GitHub Issues](https://github.com/phoenix0086/HarmonyLink/issues) 联系作者。反馈时请附上手机型号、鸿蒙版本、macOS 版本、连接方式以及能复现问题的操作步骤。
+遇到连接、操作或文件传输问题，欢迎添加作者微信 **`linhaoaiai`**，也可以在 [GitHub Issues](https://github.com/phoenix0086/HarmonyLink/issues) 反馈。反馈时请附上手机型号、鸿蒙版本、macOS 版本、连接方式以及能复现问题的操作步骤。
 
 ## 许可
 
