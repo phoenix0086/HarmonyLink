@@ -1,0 +1,14 @@
+/*
+!/.gitignore
+!/LICENSE
+!/README.md
+!/Info.plist
+!/build.sh
+!/Sources/
+!/Resources/
+
+/Sources/*
+!/Sources/*.swift
+/Resources/*
+!/Resources/AppIcon.png
+!/Resources/AppIcon.icns
