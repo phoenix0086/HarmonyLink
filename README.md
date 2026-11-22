@@ -37,6 +37,8 @@ USB 模式下，在手机上解锁并授权 USB 调试。Wi‑Fi 模式下，在
 
 遇到连接、操作或文件传输问题，欢迎添加作者微信 **`linhaoaiai`**，也可以在 [GitHub Issues](https://github.com/phoenix0086/HarmonyLink/issues) 反馈。反馈时请附上手机型号、鸿蒙版本、macOS 版本、连接方式以及能复现问题的操作步骤。
 
+<img src="docs/wechat-qr.png" width="240" alt="作者微信二维码，微信号 linhaoaiai">
+
 ## 许可
 
 HarmonyLink 自有源码、构建脚本、文档和图标公开供非商用使用。商用须取得版权方书面许可，详情见 [LICENSE](LICENSE)。
