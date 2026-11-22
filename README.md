@@ -4,6 +4,14 @@ HarmonyLink 是一款面向 Apple 芯片 Mac 的鸿蒙投屏应用。用 USB 或
 
 ## 实机截图
 
+### Mac 端连接界面
+
+| USB 连接 | Wi‑Fi 连接与画质设置 |
+| :---: | :---: |
+| <img src="docs/macos-usb-setup.jpg" width="260" alt="HarmonyLink 的 macOS USB 设备选择和自动投屏界面"> | <img src="docs/macos-wifi-setup.jpg" width="260" alt="HarmonyLink 的 macOS 无线调试地址和画质设置界面"> |
+
+### 鸿蒙投屏窗口
+
 | USB 投屏与鼠标操作 | 连接详情与文件发送 |
 | :---: | :---: |
 | <img src="docs/mirror-usb.jpg" width="260" alt="HarmonyLink 通过 USB 投屏并操作手机计算器"> | <img src="docs/connection-details.jpg" width="260" alt="HarmonyLink 的 USB 连接详情和文件发送入口"> |

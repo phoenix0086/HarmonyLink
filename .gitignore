@@ -17,4 +17,6 @@
 /docs/*
 !/docs/mirror-usb.jpg
 !/docs/connection-details.jpg
+!/docs/macos-usb-setup.jpg
+!/docs/macos-wifi-setup.jpg
 !/docs/wechat-qr.png
