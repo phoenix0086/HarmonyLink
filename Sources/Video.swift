@@ -7,12 +7,16 @@ import UniformTypeIdentifiers
 @MainActor
 final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSource {
     private let display = AVSampleBufferDisplayLayer()
-    private var sps = Data()
-    private var pps = Data()
-    private var format: CMVideoFormatDescription?
+    private var displayedFormat: CMVideoFormatDescription?
+    private var needsKeyframe = true
     private var screen = CGSize.zero
     private var touchActive = false
-    private var photoPress: (event: NSEvent, photo: GalleryPhoto)?
+    private var photoPress: (event: NSEvent, photo: GalleryPhoto?, exportRequested: Bool)?
+    var dragTiles = [GallerySelection.DragTile]()
+    var onDragTile: ((GallerySelection.DragTile, CGPoint) -> GalleryTileDrag?)?
+    var onHoldTile: ((CGPoint) -> Void)?
+    private var tilePress: (event: NSEvent, point: CGPoint, tile: GallerySelection.DragTile)?
+    private var tileDrag: GalleryTileDrag?
     private let photoHandle = GalleryDragHandle(frame: .zero)
     private let addPhotoButton = NSButton()
     private let clearPhotosButton = NSButton()
@@ -38,9 +42,16 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
         didSet { needsLayout = true }
     }
     var onCheckGallery: (() -> Void)?
-    var onDragPhotos: (([GalleryPhoto], Bool) -> [GalleryPhotoPromise])?
+    var onReadGallerySelection: (([GalleryPhoto]) async throws -> [GalleryPhoto])?
+    private var selectionSaveTask: Task<Void, Never>?
+    var onPhotoSaveStatus: ((String, Bool) -> Void)?
+    private var sharedSaveTask: Task<Void, Never>?
+    private var photoSavePanel: NSOpenPanel?
+    var onDragPhotos: (([GalleryPhoto]) -> [GalleryPhotoPromise])?
     var onSelectGalleryPhoto: ((GalleryPhoto, @escaping (GalleryPhoto?) -> Void) -> Void)?
     private var pendingPhotoSelection: UUID?
+    var sharedBatch: SharedPhotoBatch? { didSet { needsLayout = true } }
+    var onSharedBatchDropped: ((SharedPhotoBatch) -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -53,7 +64,8 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
         addSubview(photoHandle)
         photoHandle.onDrag = { [weak self] event in
             guard let self else { return }
-            self.startPhotoDrag(self.photoPromises(), with: event)
+            if let batch = self.sharedBatch { self.startSharedDrag(batch, with: event) }
+            else { self.startPhotoDrag(self.photoPromises(), with: event) }
         }
         photoHandle.onSave = { [weak self] in self?.savePhotos() }
         configurePhotoButton(addPhotoButton, icon: "plus", label: "加入批量", action: #selector(togglePhoto))
@@ -97,45 +109,70 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
     }
 
     private func photoPromises() -> [GalleryPhotoPromise] {
-        if !selectedPhotos.isEmpty { return onDragPhotos?(selectedPhotos, false) ?? [] }
-        if let galleryPhoto { return onDragPhotos?([galleryPhoto], true) ?? [] }
+        if !selectedPhotos.isEmpty { return onDragPhotos?(selectedPhotos) ?? [] }
+        if let galleryPhoto { return onDragPhotos?([galleryPhoto]) ?? [] }
         return []
     }
 
     private func savePhotos() {
-        guard let window else { return }
-        let promises = photoPromises()
-        if promises.count == 1, let promise = promises.first {
-            let panel = NSSavePanel()
-            panel.title = "保存手机照片"
-            panel.nameFieldStringValue = promise.filename
-            panel.beginSheetModal(for: window) { response in
-                guard response == .OK, let url = panel.url else { return }
-                promise.export(to: url, replacing: true) { _ in }
-            }
-        } else if !promises.isEmpty {
-            let panel = NSOpenPanel()
-            panel.title = "选择原图保存位置"
-            panel.canChooseFiles = false
-            panel.canChooseDirectories = true
-            panel.canCreateDirectories = true
-            panel.beginSheetModal(for: window) { response in
-                guard response == .OK, let folder = panel.url else { return }
-                var names = Set<String>()
-                for promise in promises {
-                    let stem = (promise.filename as NSString).deletingPathExtension
-                    let ext = (promise.filename as NSString).pathExtension
-                    var name = promise.filename
-                    var index = 2
-                    while names.contains(name.lowercased()) ||
-                            FileManager.default.fileExists(atPath: folder.appendingPathComponent(name).path) {
-                        name = "\(stem) \(index).\(ext)"
-                        index += 1
+        guard let window, window.attachedSheet == nil, sharedSaveTask == nil,
+              selectionSaveTask == nil, let read = onReadGallerySelection else { return }
+        let pending = selectedPhotos
+        let shared = sharedBatch
+        choosePhotoFolder(for: window) { [weak self] folder in
+            guard let self else { return }
+            self.selectionSaveTask = Task {
+                defer { self.selectionSaveTask = nil; self.needsLayout = true }
+                self.onPhotoSaveStatus?("正在读取图库选中的照片…", true)
+                var saved = 0
+                do {
+                    let photos = try await read(pending)
+                    try Task.checkCancellation()
+                    if photos.isEmpty, let shared, self.sharedBatch?.id == shared.id {
+                        self.saveSharedPhotos(shared, to: folder)
+                        return
                     }
-                    names.insert(name.lowercased())
-                    promise.export(to: folder.appendingPathComponent(name), replacing: false) { _ in }
+                    guard !photos.isEmpty else {
+                        throw PhotoExportError(message: "请先在手机图库中勾选要保存的照片。")
+                    }
+                    let promises = self.onDragPhotos?(photos) ?? []
+                    guard promises.count == photos.count else {
+                        throw PhotoExportError(message: "手机连接已断开。")
+                    }
+                    for promise in promises {
+                        try Task.checkCancellation()
+                        try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, Error>) in
+                            promise.export(toFolder: folder) { error in
+                                if let error { completion.resume(throwing: error) }
+                                else { completion.resume() }
+                            }
+                        }
+                        saved += 1
+                    }
+                    if !Task.isCancelled { self.onPhotoSaveStatus?("已保存 " + String(saved) + " 张原图", false) }
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    let prefix = saved == 0 ? "" : "已保存 " + String(saved) + " 张。"
+                    self.onPhotoSaveStatus?(prefix + error.localizedDescription, false)
                 }
             }
+            self.needsLayout = true
+        }
+    }
+
+    private func choosePhotoFolder(for window: NSWindow, save: @escaping (URL) -> Void) {
+        let panel = NSOpenPanel()
+        panel.title = "选择 Mac 保存位置"
+        panel.prompt = "保存"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        photoSavePanel = panel
+        panel.beginSheetModal(for: window) { [weak self, weak panel] response in
+            guard let self, let panel, self.photoSavePanel === panel else { return }
+            self.photoSavePanel = nil
+            guard response == .OK, let folder = panel.url else { return }
+            save(folder)
         }
     }
 
@@ -155,21 +192,21 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
 
     private func layoutPhotoHandle() {
         let count = selectedPhotos.count
-        photoHandle.title = count > 0 ? "拖出 \(count) 张原图" : "拖出原图"
-        photoHandle.isEnabled = count > 0 || galleryPhoto != nil
-        photoHandle.toolTip = photoHandle.isEnabled
-            ? "按住拖到 Finder 或桌面，点击也可以保存原图"
-            : "在投屏中打开一张图库照片"
+        photoHandle.title = "选择手机照片"
+        photoHandle.image = NSImage(systemSymbolName: "photo.on.rectangle", accessibilityDescription: nil)
+        photoHandle.isEnabled = sharedSaveTask == nil && selectionSaveTask == nil && onReadGallerySelection != nil
+        photoHandle.toolTip = "将手机图库中已选的照片保存到 Mac。"
         let alreadySelected = selectedPhotos.contains { $0.uri == galleryPhoto?.uri }
         addPhotoButton.image = NSImage(systemSymbolName: alreadySelected ? "checkmark" : "plus", accessibilityDescription: nil)
         addPhotoButton.setAccessibilityLabel(alreadySelected ? "移出批量" : "加入批量")
         addPhotoButton.toolTip = alreadySelected ? "移出批量" : "加入批量"
         addPhotoButton.isEnabled = galleryPhoto != nil && pendingPhotoSelection == nil
-        clearPhotosButton.isHidden = count == 0
+        addPhotoButton.isHidden = sharedBatch != nil || galleryPhoto == nil
+        clearPhotosButton.isHidden = count == 0 || sharedBatch != nil
         let y = bounds.maxY - photoBarHeight + 4
         let width = min(140, max(96, photoHandle.fittingSize.width))
-        photoHandle.frame = CGRect(x: 8, y: y, width: width, height: 28)
-        addPhotoButton.frame = CGRect(x: photoHandle.frame.maxX + 5, y: y, width: 32, height: 28)
+        photoHandle.frame = CGRect(x: max(8, bounds.maxX - width - 8), y: y, width: width, height: 28)
+        addPhotoButton.frame = CGRect(x: 8, y: y, width: 32, height: 28)
         clearPhotosButton.frame = CGRect(x: addPhotoButton.frame.maxX + 4, y: y, width: 26, height: 28)
     }
 
@@ -187,14 +224,26 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
     }
 
     func reset() {
+        selectionSaveTask?.cancel()
+        selectionSaveTask = nil
+        let panel = photoSavePanel
+        photoSavePanel = nil
+        panel?.cancel(nil)
+        sharedSaveTask?.cancel()
+        sharedSaveTask = nil
+        sharedBatch?.cleanUpLater()
+        sharedBatch = nil
         if window?.firstResponder === self { window?.makeFirstResponder(nil) }
         display.flushAndRemoveImage()
-        sps = Data()
-        pps = Data()
-        format = nil
+        displayedFormat = nil
+        needsKeyframe = true
         dimensions = .zero
         screen = .zero
         touchActive = false
+        dragTiles = []
+        tilePress = nil
+        tileDrag?.cancel()
+        tileDrag = nil
         galleryPhoto = nil
         clearPhotos()
         photoPress = nil
@@ -206,120 +255,27 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
     }
 
     @discardableResult
-    func consume(_ data: Data) -> Bool {
-        let nalUnits = Self.annexBRanges(data)
-        var accessUnit = Data()
-        var hasSlice = false
-        var keyframe = false
-        for range in nalUnits {
-            let nal = data[range]
-            guard let first = nal.first else { continue }
-            switch first & 0x1f {
-            case 7:
-                if sps != nal { sps = Data(nal); format = nil }
-            case 8:
-                if pps != nal { pps = Data(nal); format = nil }
-            case 1, 5:
-                hasSlice = true
-                keyframe = keyframe || (first & 0x1f == 5)
-                Self.append(nal, to: &accessUnit)
-            case 6:
-                Self.append(nal, to: &accessUnit)
-            default:
-                break
-            }
-        }
-        guard hasSlice else { return false }
-        if display.status == .failed {
+    func present(_ frame: MirrorFrame) -> Bool {
+        if display.status == .failed || display.requiresFlushToResumeDecoding {
+            needsKeyframe = true
+            guard frame.keyframe else { return false }
             display.flushAndRemoveImage()
-            format = nil
         }
-        if format == nil {
-            guard keyframe, !sps.isEmpty, !pps.isEmpty else { return false }
-            var description: CMFormatDescription?
-            let status = sps.withUnsafeBytes { spsBytes in
-                pps.withUnsafeBytes { ppsBytes in
-                    let pointers = [
-                        spsBytes.bindMemory(to: UInt8.self).baseAddress!,
-                        ppsBytes.bindMemory(to: UInt8.self).baseAddress!
-                    ]
-                    return CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                        allocator: kCFAllocatorDefault, parameterSetCount: 2,
-                        parameterSetPointers: pointers, parameterSetSizes: [sps.count, pps.count],
-                        nalUnitHeaderLength: 4, formatDescriptionOut: &description
-                    )
-                }
-            }
-            guard status == noErr, let description else { return false }
-            let size = CMVideoFormatDescriptionGetDimensions(description)
-            dimensions = CGSize(width: Int(size.width), height: Int(size.height))
-            display.flush()
-            format = description
-        }
-
-        var block: CMBlockBuffer?
-        let length = accessUnit.count
-        guard CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: length,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
-            dataLength: length, flags: 0, blockBufferOut: &block
-        ) == noErr, let block, let format else { return false }
-
-        let copyStatus = accessUnit.withUnsafeBytes {
-            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
-                                          offsetIntoDestination: 0, dataLength: length)
-        }
-        guard copyStatus == noErr else { return false }
-        var sample: CMSampleBuffer?
-        var size = length
-        guard CMSampleBufferCreateReady(
-            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
-            sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil,
-            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample
-        ) == noErr, let sample,
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) else {
+        // After dropping a frame, wait for an IDR before resuming inter-frame decoding.
+        guard !needsKeyframe || frame.keyframe else { return false }
+        guard display.isReadyForMoreMediaData else {
+            needsKeyframe = true
             return false
         }
-        let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-        CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        display.enqueue(sample)
-        return true
-    }
-
-    private static func append(_ nal: Data, to data: inout Data) {
-        var size = UInt32(nal.count).bigEndian
-        withUnsafeBytes(of: &size) { data.append(contentsOf: $0) }
-        data.append(nal)
-    }
-
-    nonisolated static func annexBRanges(_ data: Data) -> [Range<Data.Index>] {
-        data.withUnsafeBytes { bytes in
-            var units = [Range<Data.Index>]()
-            var start: Int?
-            var index = 0
-            let base = data.startIndex
-            while index + 2 < bytes.count {
-                guard bytes[index] == 0, bytes[index + 1] == 0 else {
-                    index += 1
-                    continue
-                }
-                let prefix: Int
-                if bytes[index + 2] == 1 {
-                    prefix = 3
-                } else if index + 3 < bytes.count, bytes[index + 2] == 0, bytes[index + 3] == 1 {
-                    prefix = 4
-                } else {
-                    index += 1
-                    continue
-                }
-                if let start, index > start { units.append((base + start)..<(base + index)) }
-                start = index + prefix
-                index += prefix
-            }
-            if let start, start < bytes.count { units.append((base + start)..<data.endIndex) }
-            return units
+        if needsKeyframe || displayedFormat != frame.format {
+            display.flush()
+            displayedFormat = frame.format
+            let size = CMVideoFormatDescriptionGetDimensions(frame.format)
+            dimensions = CGSize(width: Int(size.width), height: Int(size.height))
         }
+        display.enqueue(frame.sample)
+        needsKeyframe = false
+        return true
     }
 
     private var phoneSize: CGSize? {
@@ -368,6 +324,7 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
     override func rightMouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if AVMakeRect(aspectRatio: dimensions, insideRect: videoBounds).contains(point) {
+            galleryPhoto = nil
             onBack?()
             onCheckGallery?()
         }
@@ -375,8 +332,12 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
 
     override func mouseDown(with event: NSEvent) {
         guard let point = phonePoint(event, clip: false) else { return }
-        if let galleryPhoto, galleryPhoto.bounds.contains(point) {
-            photoPress = (event, galleryPhoto)
+        let exportRequested = event.modifierFlags.contains(.option)
+        if let tile = dragTiles.first(where: { $0.bounds.contains(point) }) {
+            tilePress = (event, point, tile)
+        } else if exportRequested || galleryPhoto?.bounds.contains(point) == true {
+            photoPress = (event, galleryPhoto, exportRequested)
+            if galleryPhoto == nil { onCheckGallery?() }
         } else {
             touchActive = send("down", event, clip: false)
         }
@@ -386,20 +347,36 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let press = tilePress {
+            let dx = abs(event.locationInWindow.x - press.event.locationInWindow.x)
+            let dy = abs(event.locationInWindow.y - press.event.locationInWindow.y)
+            guard max(dx, dy) >= 5 else { return }
+            tilePress = nil
+            if dx >= dy || event.modifierFlags.contains(.option) {
+                if let batch = onDragTile?(press.tile, press.point) {
+                    tileDrag = batch
+                    startPromiseDrag(batch.providers(), with: event)
+                }
+                return
+            }
+            touchActive = send("down", press.event, clip: true)
+        }
         if let start = photoPress {
             let point = convert(event.locationInWindow, from: nil)
             let origin = convert(start.event.locationInWindow, from: nil)
             let dx = abs(point.x - origin.x)
             let dy = abs(point.y - origin.y)
             let approachingEdge = dx > max(8, dy)
-                && (point.x < origin.x ? point.x <= bounds.minX + 9 : point.x >= bounds.maxX - 9)
-            if (approachingEdge || event.modifierFlags.contains(.option) && dx + dy > 6),
-               let promises = onDragPhotos?([start.photo], true), !promises.isEmpty {
+                && (point.x < origin.x ? point.x <= bounds.minX + 16 : point.x >= bounds.maxX - 16)
+            let explicitlyDragging = start.exportRequested || event.modifierFlags.contains(.option)
+            if (approachingEdge || explicitlyDragging && dx + dy > 4),
+               let photo = start.photo ?? galleryPhoto,
+               let promises = onDragPhotos?([photo]), !promises.isEmpty {
                 photoPress = nil
-                startPhotoDrag(promises, with: start.event)
+                startPhotoDrag(promises, with: event)
                 return
             }
-            guard dy > max(10, dx) else { return }
+            guard !explicitlyDragging, dy > max(10, dx) else { return }
             photoPress = nil
             touchActive = send("down", start.event, clip: true)
         }
@@ -407,26 +384,46 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let press = tilePress {
+            tilePress = nil
+            if event.timestamp - press.event.timestamp >= 0.45 {
+                onHoldTile?(press.point)
+                return
+            }
+            touchActive = send("down", press.event, clip: true)
+        }
         if let start = photoPress {
             photoPress = nil
-            touchActive = send("down", start.event, clip: true)
-            if abs(event.locationInWindow.x - start.event.locationInWindow.x) > 4 {
-                _ = send("dragRelease", event, clip: true)
+            if !start.exportRequested {
+                touchActive = send("down", start.event, clip: true)
+                if abs(event.locationInWindow.x - start.event.locationInWindow.x) > 4 {
+                    _ = send("dragRelease", event, clip: true)
+                }
             }
         }
-        if touchActive { _ = send("up", event, clip: true) }
+        if touchActive {
+            galleryPhoto = nil
+            _ = send("up", event, clip: true)
+        }
         touchActive = false
         onCheckGallery?()
     }
 
     private func startPhotoDrag(_ promises: [GalleryPhotoPromise], with event: NSEvent) {
         guard !promises.isEmpty else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        let items = promises.enumerated().map { index, promise in
+        let providers = promises.map { promise in
             let provider = NSFilePromiseProvider(fileType: promise.photo.type, delegate: promise)
             provider.userInfo = promise
+            return provider
+        }
+        startPromiseDrag(providers, with: event)
+    }
+
+    private func startPromiseDrag(_ providers: [NSFilePromiseProvider], with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let items = providers.enumerated().map { index, provider in
             let item = NSDraggingItem(pasteboardWriter: provider)
-            let icon = NSWorkspace.shared.icon(for: UTType(promise.photo.type) ?? .image)
+            let icon = NSWorkspace.shared.icon(for: UTType(provider.fileType) ?? .image)
             let offset = CGFloat(min(index, 3)) * 3
             item.setDraggingFrame(CGRect(x: point.x - 20 + offset, y: point.y - 20 + offset,
                                          width: 40, height: 40), contents: icon)
@@ -438,6 +435,62 @@ final class MirrorVideo: NSView, @preconcurrency NSTextInputClient, NSDraggingSo
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
         context == .outsideApplication ? .copy : []
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        if operation.isEmpty { tileDrag?.cancel() }
+        tileDrag = nil
+        onCheckGallery?()
+    }
+
+    func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
+
+    private func startSharedDrag(_ batch: SharedPhotoBatch, with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let icon = NSWorkspace.shared.icon(for: .image)
+        var copied = Set<URL>()
+        let items = batch.files.enumerated().map { index, url in
+            let promise = SharedPhotoPromise(source: url) { [weak self] in
+                copied.insert(url)
+                if copied.count == batch.files.count { self?.onSharedBatchDropped?(batch) }
+            }
+            let item = NSDraggingItem(pasteboardWriter: promise.makeProvider())
+            let offset = CGFloat(min(index, 3)) * 3
+            item.setDraggingFrame(CGRect(x: point.x - 20 + offset, y: point.y - 20 + offset,
+                                         width: 40, height: 40), contents: icon)
+            return item
+        }
+        let session = beginDraggingSession(with: items, event: event, source: self)
+        session.animatesToStartingPositionsOnCancelOrFail = true
+    }
+
+    private func saveSharedPhotos(_ batch: SharedPhotoBatch, to folder: URL) {
+        onPhotoSaveStatus?("正在保存 \(batch.files.count) 张原图…", true)
+        sharedSaveTask = Task { [weak self] in
+            let worker = Task.detached(priority: .userInitiated) {
+                for file in batch.files {
+                    try Task.checkCancellation()
+                    let destination = PhonePhotoExport.availableDestination(in: folder, filename: file.lastPathComponent)
+                    try FileManager.default.copyItem(at: file, to: destination)
+                }
+            }
+            let result = await withTaskCancellationHandler {
+                await worker.result
+            } onCancel: {
+                worker.cancel()
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.sharedSaveTask = nil
+            self.needsLayout = true
+            switch result {
+            case .success:
+                self.onSharedBatchDropped?(batch)
+                self.onPhotoSaveStatus?("已保存 \(batch.files.count) 张原图", false)
+            case .failure(let error):
+                self.onPhotoSaveStatus?("保存原图失败。\(error.localizedDescription)", false)
+            }
+        }
+        needsLayout = true
     }
 
     override func keyDown(with event: NSEvent) {
@@ -537,8 +590,9 @@ private final class GalleryDragHandle: NSButton {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let event = press else { return }
-        press = nil
+        guard let press, hypot(event.locationInWindow.x - press.locationInWindow.x,
+                               event.locationInWindow.y - press.locationInWindow.y) > 4 else { return }
+        self.press = nil
         highlight(false)
         onDrag?(event)
     }

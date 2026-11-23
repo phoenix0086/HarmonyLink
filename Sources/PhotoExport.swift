@@ -32,6 +32,19 @@ enum PhonePhotoExport {
         }
     }
 
+    static func availableDestination(in folder: URL, filename: String) -> URL {
+        let name = filename as NSString
+        let stem = name.deletingPathExtension
+        let ext = name.pathExtension
+        var destination = folder.appendingPathComponent(filename)
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: destination.path) {
+            destination = folder.appendingPathComponent("\(stem) \(suffix)").appendingPathExtension(ext)
+            suffix += 1
+        }
+        return destination
+    }
+
     static func receive(name: String, source: PhotoSource, hdc: String, device: Device, directory: URL,
                         galleryURI: String? = nil) async throws -> URL {
         guard imageType(for: name) != nil else {

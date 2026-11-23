@@ -16,9 +16,11 @@ struct HarmonyLinkApp: App {
                 Button("发送文件到手机…") { connection.chooseFiles() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
                     .disabled(!connection.canSendFiles)
-                Button("从手机取照片…") { connection.showPhotoExport = true }
+                Button("浏览手机图库…") { connection.showPhotoExport = true }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(connection.active == nil)
+                Button("重新投屏") { connection.reconnect() }
+                    .disabled(connection.active == nil || connection.refreshing || connection.transferring)
                 Divider()
                 Button("放大窗口") { connection.zoomRequest = MirrorZoomRequest(action: .inLarger) }
                     .keyboardShortcut("=", modifiers: .command)
@@ -106,7 +108,7 @@ struct MirrorWindow: View {
             }
         }
         .sheet(isPresented: $connection.showPhotoExport) {
-            if let device = connection.active { PhotoExportSheet(device: device) }
+            if let device = connection.active { PhotoBrowserSheet(device: device) }
         }
         .task {
             await connection.refresh()
@@ -323,11 +325,9 @@ struct MirrorWindow: View {
                     Text(device.id).monospaced().textSelection(.enabled)
                 }
             }
-            if let seconds = connection.firstFrameSeconds {
-                LabeledContent("首帧耗时") {
-                    Text("\(seconds, format: .number.precision(.fractionLength(1))) 秒").monospacedDigit()
-                }
-            }
+            if let seconds = connection.bridgeReadySeconds { timing("桥接就绪", seconds: seconds) }
+            if let seconds = connection.firstPacketSeconds { timing("收到视频数据", seconds: seconds) }
+            if let seconds = connection.firstFrameSeconds { timing("首帧显示", seconds: seconds) }
             let size = connection.videoDimensions
             if size.width > 0, size.height > 0 {
                 LabeledContent("投屏分辨率") {
@@ -338,6 +338,10 @@ struct MirrorWindow: View {
                 wirelessQualityPicker
             }
             Divider()
+            Button { connection.reconnect() } label: {
+                Label("重新投屏", systemImage: "arrow.clockwise")
+            }
+            .disabled(connection.refreshing || connection.transferring)
             Button { connection.chooseFiles() } label: {
                 Label("发送文件到手机…", systemImage: "square.and.arrow.up")
             }
@@ -352,4 +356,10 @@ struct MirrorWindow: View {
         .padding(16)
         .frame(width: 285)
     }
+    private func timing(_ label: String, seconds: Double) -> some View {
+        LabeledContent(label) {
+            Text("\(seconds, format: .number.precision(.fractionLength(1))) 秒").monospacedDigit()
+        }
+    }
+
 }

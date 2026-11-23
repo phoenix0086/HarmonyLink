@@ -183,6 +183,8 @@ final class MirrorConnection: ObservableObject {
     @Published private(set) var wirelessQuality =
         WirelessPictureQuality(rawValue: UserDefaults.standard.integer(forKey: "wirelessQuality")) ?? .clear
     @Published private(set) var firstFrameSeconds: Double?
+    @Published private(set) var bridgeReadySeconds: Double?
+    @Published private(set) var firstPacketSeconds: Double?
     @Published var address = UserDefaults.standard.string(forKey: "wirelessAddress") ?? ""
     @Published private(set) var active: Device?
     @Published private(set) var picture = false
@@ -198,6 +200,7 @@ final class MirrorConnection: ObservableObject {
 
     let video = MirrorVideo(frame: .zero)
     private var process: Process?
+    private var closingProcess: Process?
     private var socket: URLSessionWebSocketTask?
     private var receiver: Task<Void, Never>?
     private var sender: Task<Void, Never>?
@@ -215,7 +218,8 @@ final class MirrorConnection: ObservableObject {
     private var inputQueue = [PhoneInput]()
     private var inputTask: Task<Void, Never>?
     private var galleryCheck: Task<Void, Never>?
-    private var galleryMonitor: Task<Void, Never>?
+    private var shareMonitor: Task<Void, Never>?
+    private var deliveredShareIDs: Set<UUID> = []
     private var galleryRevision = 0
     private let galleryTransfers = GalleryTransferQueue()
 
@@ -245,6 +249,16 @@ final class MirrorConnection: ObservableObject {
         video.onText = { [weak self] in self?.enqueueInput(.text($0)) }
         video.onEditKey = { [weak self] in self?.enqueueInput(.key($0)) }
         video.onCheckGallery = { [weak self] in self?.checkGallery() }
+        video.onPhotoSaveStatus = { [weak self] in self?.showTransferStatus($0, ongoing: $1) }
+        video.onReadGallerySelection = { [weak self] pending in
+            guard let self, self.picture, let device = self.active, let hdc = Tools.hdc else {
+                throw PhotoExportError(message: "请先连接手机。")
+            }
+            self.galleryCheck?.cancel()
+            self.galleryCheck = nil
+            return try await GallerySelection.read(hdc: hdc, device: device, fallback: pending)
+        }
+        video.onSharedBatchDropped = { [weak self] batch in self?.finishSharedBatch(batch) }
         video.onSelectGalleryPhoto = { [weak self] photo, apply in
             guard let self, self.picture, let device = self.active, let hdc = Tools.hdc else {
                 apply(nil)
@@ -259,9 +273,31 @@ final class MirrorConnection: ObservableObject {
                 apply(matches ? current : nil)
             }
         }
-        video.onDragPhotos = { [weak self] photos, verifyCurrent in
-            guard let self, self.picture, let device = self.active, let hdc = Tools.hdc else { return [] }
+        video.onDragPhotos = { [weak self] photos in self?.photoPromiseFactory()?(photos) ?? [] }
+        video.onDragTile = { [weak self] tile, point in
+            guard let self, let device = self.active, let hdc = Tools.hdc,
+                  let make = self.photoPromiseFactory() else { return nil }
+            return GalleryTileDrag(count: tile.fileCount) {
+                let photos = try await GallerySelection.draggedPhotos(tile, at: point, hdc: hdc, device: device)
+                return make(photos)
+            }
+        }
+        video.onHoldTile = { [weak self] point in
+            guard let self, let device = self.active, let hdc = Tools.hdc else { return }
             let attempt = self.id
+            Task {
+                _ = await Tools.run(hdc, ["-t", device.id, "shell", "uitest", "uiInput", "longClick",
+                                          String(Int(point.x)), String(Int(point.y))])
+                if self.id == attempt { self.checkGallery() }
+            }
+        }
+    }
+
+    private func photoPromiseFactory() -> (@Sendable ([GalleryPhoto]) -> [GalleryPhotoPromise])? {
+        guard picture, let device = active, let hdc = Tools.hdc else { return nil }
+        let attempt = id
+        let queue = galleryTransfers
+        return { [weak self] photos in
             var used = Set<String>()
             return photos.map { photo in
                 let base = (photo.name as NSString).deletingPathExtension
@@ -272,8 +308,8 @@ final class MirrorConnection: ObservableObject {
                     name = "\(base) \(suffix).\(ext)"
                     suffix += 1
                 }
-                return GalleryPhotoPromise(photo: photo, filename: name, verifyCurrent: verifyCurrent,
-                                           hdc: hdc, device: device, transfers: self.galleryTransfers,
+                return GalleryPhotoPromise(photo: photo, filename: name,
+                                           hdc: hdc, device: device, transfers: queue,
                                            isCurrentSession: { [weak self] in self?.id == attempt }) { [weak self] message, ongoing in
                     guard let self, self.id == attempt else { return }
                     self.showTransferStatus(message, ongoing: ongoing)
@@ -294,35 +330,64 @@ final class MirrorConnection: ObservableObject {
         }
     }
 
-    private func monitorGallery() {
-        checkGallery()
+    private func monitorSharedPhotos() {
+        guard let device = active, let hdc = Tools.hdc else { return }
         let attempt = id
-        galleryMonitor = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
-                guard let self, self.id == attempt, !Task.isCancelled else { return }
-                guard self.galleryCheck == nil, !self.transferring, self.video.window?.isKeyWindow == true,
-                      self.lastTouchPoint == nil else { continue }
-                self.checkGallery()
+        shareMonitor = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, await GalleryShareInbox.isInstalled(hdc: hdc, device: device) else { return }
+            while let self, self.id == attempt, !Task.isCancelled {
+                if self.video.sharedBatch == nil, !self.transferring, self.lastTouchPoint == nil,
+                   self.galleryCheck == nil {
+                    let pending = await GalleryShareInbox.pending(hdc: hdc, device: device)
+                    guard self.id == attempt, !Task.isCancelled else { return }
+                    if let batch = pending.first(where: { !self.deliveredShareIDs.contains($0) }) {
+                        self.showTransferStatus("正在接收图库分享的原图…", ongoing: true)
+                        do {
+                            let received = try await GalleryShareInbox.receive(batch, hdc: hdc, device: device)
+                            guard self.id == attempt, !Task.isCancelled else {
+                                received.cleanUpLater()
+                                return
+                            }
+                            self.video.sharedBatch = received
+                            self.showTransferStatus("已收到 \(received.files.count) 张原图", ongoing: false)
+                        } catch {
+                            guard self.id == attempt, !Task.isCancelled else { return }
+                            self.showTransferStatus("接收原图失败。\(error.localizedDescription)", ongoing: false)
+                            try? await Task.sleep(for: .seconds(12))
+                        }
+                    }
+                }
+                try? await Task.sleep(for: .seconds(2))
             }
         }
     }
 
+    private func finishSharedBatch(_ batch: SharedPhotoBatch) {
+        guard let device = active, let hdc = Tools.hdc, video.sharedBatch?.id == batch.id else { return }
+        deliveredShareIDs.insert(batch.id)
+        video.sharedBatch = nil
+        batch.cleanUpLater()
+        Task { await GalleryShareInbox.acknowledge(batch.id, hdc: hdc, device: device) }
+    }
+
     private func checkGallery() {
-        guard picture, let device = active, let hdc = Tools.hdc else { return }
+        guard picture, !transferring, video.sharedBatch == nil, let device = active, let hdc = Tools.hdc else { return }
         galleryRevision &+= 1
         guard galleryCheck == nil else { return }
         let attempt = id
         galleryCheck = Task { [weak self] in
             while let self, self.id == attempt, !Task.isCancelled {
                 let revision = self.galleryRevision
-                try? await Task.sleep(for: .milliseconds(device.wireless ? 260 : 180))
+                try? await Task.sleep(for: .milliseconds(650))
                 guard self.id == attempt, !Task.isCancelled else { return }
                 guard self.galleryRevision == revision else { continue }
-                let photo = await GalleryPhoto.current(hdc: hdc, device: device)
+                let layout = await GalleryPhoto.layout(hdc: hdc, device: device)
+                let photo = layout.flatMap(GalleryPhoto.photo(in:))
                 guard self.id == attempt, !Task.isCancelled else { return }
                 guard self.galleryRevision == revision else { continue }
                 self.galleryCheck = nil
+                self.video.dragTiles = layout.map(GallerySelection.dragTiles(in:)) ?? []
                 if self.video.galleryPhoto != photo { self.video.galleryPhoto = photo }
                 return
             }
@@ -357,6 +422,7 @@ final class MirrorConnection: ObservableObject {
         transferTask = Task { [weak self] in
             guard let self else { return }
             var sent = 0
+            var photos = 0
             var lastError: String?
             for (index, file) in files.enumerated() {
                 guard self.id == attempt, !Task.isCancelled else { return }
@@ -365,16 +431,17 @@ final class MirrorConnection: ObservableObject {
                     lastError = error
                 } else {
                     sent += 1
+                    if PhoneFileTransfer.isPhoto(file) { photos += 1 }
                 }
             }
             guard self.id == attempt, !Task.isCancelled else { return }
             self.transferring = false
             self.transferTask = nil
-            self.transferStatus = switch sent {
-            case files.count: "已发送 \(sent) 个文件 · \(PhoneFileTransfer.displayFolder)"
-            case 0: lastError ?? "发送失败。"
-            default: "已发送 \(sent)/\(files.count) 个文件 · \(PhoneFileTransfer.displayFolder)"
-            }
+            var results = [String]()
+            if photos > 0 { results.append("已导入图库 \(photos) 张") }
+            if sent > photos { results.append("已存到下载 \(sent - photos) 个文件") }
+            if let lastError { results.append("\(files.count - sent) 个发送失败。\(lastError)") }
+            self.transferStatus = results.joined(separator: " · ")
             self.transferMessageTimer = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(sent == 0 ? 14 : 6))
                 if !Task.isCancelled { self?.transferStatus = nil }
@@ -473,10 +540,20 @@ final class MirrorConnection: ObservableObject {
         guard wirelessQuality != quality, !refreshing, !transferring else { return }
         wirelessQuality = quality
         UserDefaults.standard.set(quality.rawValue, forKey: "wirelessQuality")
-        guard active?.wireless == true else { return }
-        let previous = process
+        guard let device = active, device.wireless else { return }
+        reconnect(device, status: "正在切换 Wi‑Fi 画质", failure: "画质切换未完成")
+    }
+
+    func reconnect() {
+        guard let device = active, !refreshing, !transferring else { return }
+        reconnect(device, status: "正在重新投屏", failure: "重新投屏未完成")
+    }
+
+    private func reconnect(_ device: Device, status: String, failure: String) {
         stop()
-        status = "正在切换 Wi‑Fi 画质"
+        let previous = closingProcess
+        self.status = status
+        detail = "正在关闭上一条投屏连接。"
         refreshing = true
         let attempt = id
         Task { [weak self] in
@@ -488,16 +565,26 @@ final class MirrorConnection: ObservableObject {
             guard let self, self.id == attempt else { return }
             self.refreshing = false
             guard previous?.isRunning != true else {
-                self.status = "画质切换未完成"
+                self.status = failure
                 self.detail = "上一次投屏仍在关闭，请稍后重新连接。"
                 return
             }
-            await self.connectWireless()
+            if device.wireless {
+                await self.connectWireless()
+            } else {
+                self.connect(device)
+            }
         }
     }
 
     private func connect(_ device: Device) {
         guard active == nil, !refreshing else { return }
+        guard closingProcess?.isRunning != true else {
+            status = "正在关闭上一条投屏连接"
+            detail = "上一条连接关闭后即可重新投屏。"
+            return
+        }
+        closingProcess = nil
         guard let hdc = Tools.hdc, let java = Tools.java else {
             status = "投屏组件不完整"
             detail = "需要华为调试工具和 Java。"
@@ -510,6 +597,8 @@ final class MirrorConnection: ObservableObject {
         id = attempt
         startedAt = .now
         firstFrameSeconds = nil
+        bridgeReadySeconds = nil
+        firstPacketSeconds = nil
         streamRequestedSize = false
         active = device
         picture = false
@@ -557,10 +646,16 @@ final class MirrorConnection: ObservableObject {
             if self.socket == nil {
                 self.fail("连接超时", "请确认手机仍已授权调试，再重新连接。")
             } else {
-                self.detail = "还在等待第一帧。在手机上滑动一下屏幕，或断开后重试。"
+                self.detail = self.firstPacketSeconds == nil
+                    ? "调试连接已建立，手机暂未发送画面。请保持解锁。"
+                    : "已收到视频数据，正在等待可显示的关键帧。"
                 try? await Task.sleep(for: .seconds(18))
                 guard !Task.isCancelled, self.id == attempt, !self.picture else { return }
-                self.fail("等待画面超时", "请保持手机解锁，再连接投屏。")
+                if self.firstPacketSeconds == nil {
+                    self.fail("手机画面未送达", "调试连接已建立。请保持手机解锁后再连接。")
+                } else {
+                    self.fail("等待关键帧超时", "已收到视频数据，但画面未能显示。请重新连接投屏。")
+                }
             }
         }
     }
@@ -575,7 +670,13 @@ final class MirrorConnection: ObservableObject {
               let range = Range(match.range(at: 1), in: startupOutput),
               let port = UInt16(startupOutput[range]), port > 0,
               let url = URL(string: "ws://127.0.0.1:\(port)/") else { return }
+        bridgeReadySeconds = startupElapsedSeconds
         openSocket(url, attempt: attempt)
+    }
+
+    private var startupElapsedSeconds: Double {
+        let elapsed = (ContinuousClock.now - startedAt).components
+        return Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
     }
 
     private func openSocket(_ url: URL, attempt: UUID) {
@@ -598,9 +699,10 @@ final class MirrorConnection: ObservableObject {
                 self.fail("投屏连接中断", error.localizedDescription)
             }
         }
-        send(["type": "screen", "mode": "video"])
+        // The bundled bridge starts capture when its first WebSocket client connects.
         status = "等待手机画面"
         detail = "如果画面没有出现，在手机屏幕上滑动一下。"
+        let decoder = MirrorFrameDecoder()
         receiver = Task { [weak self] in
             do {
                 while !Task.isCancelled {
@@ -608,11 +710,14 @@ final class MirrorConnection: ObservableObject {
                     guard let self, self.id == attempt else { return }
                     switch message {
                     case .data(let data):
+                        if self.firstPacketSeconds == nil { self.firstPacketSeconds = self.startupElapsedSeconds }
                         if !self.streamRequestedSize {
                             self.streamRequestedSize = true
                             self.send(["type": "size"])
                         }
-                        let rendered = self.video.consume(data)
+                        guard let frame = await decoder.prepare(data),
+                              self.id == attempt, !Task.isCancelled else { continue }
+                        let rendered = self.video.present(frame)
                         if self.video.dimensions != self.videoDimensions {
                             self.videoDimensions = self.video.dimensions
                         }
@@ -621,10 +726,10 @@ final class MirrorConnection: ObservableObject {
                         }
                         if rendered, !self.picture {
                             self.startupTimer?.cancel()
-                            let elapsed = (ContinuousClock.now - self.startedAt).components
-                            self.firstFrameSeconds = Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18
+                            self.firstFrameSeconds = self.startupElapsedSeconds
                             self.picture = true
-                            self.monitorGallery()
+                            self.monitorSharedPhotos()
+                            self.checkGallery()
                             self.status = "已连接 · " + (self.active?.wireless == true ? "Wi‑Fi" : "USB")
                             self.detail = "点手机输入框后直接打字。右键返回上一级。"
                         }
@@ -748,8 +853,8 @@ final class MirrorConnection: ObservableObject {
         inputTask?.cancel()
         galleryCheck?.cancel()
         galleryCheck = nil
-        galleryMonitor?.cancel()
-        galleryMonitor = nil
+        shareMonitor?.cancel()
+        shareMonitor = nil
         inputTask = nil
         inputQueue.removeAll()
         lastMove = nil
@@ -761,11 +866,16 @@ final class MirrorConnection: ObservableObject {
         bridgeCommands = BridgeCommandQueue()
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
-        if let process, process.isRunning { process.terminate() }
+        if let process, process.isRunning {
+            closingProcess = process
+            process.terminate()
+        }
         process = nil
         active = nil
         picture = false
         firstFrameSeconds = nil
+        bridgeReadySeconds = nil
+        firstPacketSeconds = nil
         showControls = false
         showPhotoExport = false
         zoomRequest = nil
